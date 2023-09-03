@@ -1,0 +1,3 @@
+[submodule "vision"]
+	path = vision
+	url = git@github.com:yeti-s/vision.git
