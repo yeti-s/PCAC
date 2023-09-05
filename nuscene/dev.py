@@ -13,9 +13,21 @@ from torch import Tensor
 # coords or xyz (n, 3) -> x, y, z
 # pixel or xy (n, 2) -> x, y
 
-MIN_DISTANCE = 2.5
-MAX_DISTANCE = 25.0
+# point instance
+X = 0
+Y = 1
+Z = 2
+INTENSITY = 3
+POINT_INDEX = 4
+R = 5
+G = 6
+B = 7
 D_POINTS = 8
+
+# minimum distance with no points of ego_vehicle
+MIN_DISTANCE = 3.0
+# MAX_DISTANCE = 25.0
+
 
 SAMPLE_DATA_TYPE = {
     'RADAR': 0,
@@ -40,7 +52,9 @@ def bin_to_tensor(path)->Tensor:
             
     points = torch.tensor(points)
     points = points.reshape(-1, 5)[:,:4] # remove ring_index
-    points = torch.concatenate([points, torch.zeros(points.size(0), D_POINTS-4)], dim=1)
+    
+    n_points = points.size(0)
+    points = torch.concatenate([points, torch.zeros(n_points, B-INTENSITY)], dim=1)
     
     return points
 
@@ -159,11 +173,11 @@ class SampleData():
         
         coords = points[:,:3]
         # distance filter
-        # distance = torch.sum(torch.pow(coords, 2), dim=1)
-        # mask = distance > (MIN_DISTANCE**2)
+        distance = torch.sum(torch.pow(coords, 2), dim=1)
+        mask = distance > (MIN_DISTANCE**2)
         # mask = torch.logical_and(mask, distance < (MAX_DISTANCE**2))
-        # points = points[mask]
-        # coords = points[:,:3]
+        points = points[mask]
+        coords = points[:,:3]
         
         # lidar to ego_vehicle
         coords = torch.matmul(coords, self.rotation.T) + self.translation
@@ -213,13 +227,50 @@ class Sample():
         self.prev = json_data['prev']
         self.next = json_data['next']
         self.cameras:list[SampleData] = []
-        self.lidar = None
-        
-        self.data_list:list[SampleData] = []
+        self.lidars:list[SampleData] = []
         
     def add_sample_data(self, sample_data:SampleData)->None:
-        self.data_list.append(sample_data)
-        self.data_list = sorted(self.data_list, key=lambda x:x.timestamp)
+        if sample_data.type == SAMPLE_DATA_TYPE['RADAR']:
+            return
+        elif sample_data.type == SAMPLE_DATA_TYPE['LIDAR']:
+            self.lidars.append(sample_data)
+            self.lidars = sorted(self.lidars, key=lambda x:x.timestamp)
+            return
+
+        if sample_data.is_key_frame:
+            self.cameras.append(sample_data)
+        
+    def get_points(self)->Tensor:
+        # get all points in sample
+        points = []
+        for lidar in self.lidars:
+            points.append(lidar.get_points())
+        points = torch.concatenate(points, dim=0)
+        
+        # indexing on points
+        points[:,POINT_INDEX] = torch.arange(0, points.size(0)).float()
+        
+        # color points from camera
+        remains = points
+        processed = []
+        
+        def color_points_with_cam(points:Tensor, cam:SampleData):
+            image = cam.get_image()
+            pixel, depth = cam.points_to_pixel(points)
+            points = color_points(image, points, pixel, depth)
+            
+            mask = points[:,R]+points[:,G]
+            mask = mask + points[:,B]
+            mask = mask > 0
+            processed.append(points[mask])
+            return points[torch.logical_not(mask)]
+        
+        for cam in self.cameras:
+            remains = color_points_with_cam(remains, cam)
+        
+        points = torch.concatenate(processed, dim=0)
+        return points
+            
         
         
 class Scene():
@@ -235,47 +286,15 @@ class Scene():
     
     def get_points(self)->Tensor:
         point_index = 0
-        
-        last_cam_samples = [None]*8
-        remain_points = torch.rand(0, D_POINTS)
-        processed_points = []
-        
-        def color_points_with_cam(points:Tensor, cam:SampleData):
-            image = cam.get_image()
-            pixel, depth = cam.points_to_pixel(points)
-            points = color_points(image, points, pixel, depth)
-            
-            mask = points[:,5]+points[:,6]
-            mask = mask + points[:,7]
-            mask = mask > 0
-            processed_points.append(points[mask])
-            return points[torch.logical_not(mask)]
+        points_list = []
         
         for sample in self.sample_list:
-            print(f'get points from {sample.token}')
-            data_list = sample.data_list
+            points = sample.get_points()
+            points[:,POINT_INDEX] += point_index
+            point_index = torch.max(points[:,POINT_INDEX])+1
+            points_list.append(points)
             
-            for sample_data in data_list:
-                # camera type
-                if sample_data.type >= SAMPLE_DATA_TYPE['CAM_FRONT_LEFT']:
-                    last_cam_samples[sample_data.type] = sample_data
-                    if remain_points.size(0) > 0:
-                        remain_points = color_points_with_cam(remain_points, sample_data)
-                    continue
-                
-                # lidar
-                points = sample_data.get_points()
-                n_points = points.size(0)
-                points[:,4] = torch.arange(point_index, point_index+n_points).float()
-                point_index += n_points
-                
-                for cam in last_cam_samples:
-                    if cam == None:
-                        continue
-                    points = color_points_with_cam(points, cam)
-                remain_points = torch.concatenate([remain_points, points], dim=0)
-        
-        points = torch.concatenate(processed_points, dim=0)
+        points = torch.concatenate(points_list, dim=0)
         return points
 
 class Nuscene():
@@ -341,9 +360,6 @@ class Nuscene():
             sample_data.set_calibrated_sensor(calib_sensor)
             
             sample:Sample = sample_map[sample_data.sample_token]
-            if sample_data.type == SAMPLE_DATA_TYPE['RADAR']:
-                continue
-            
             sample.add_sample_data(sample_data)
             
     def parse_scene(self, sample_map:dict[str, Sample]) -> dict[str, Scene]:
