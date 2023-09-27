@@ -114,6 +114,21 @@ def color_points(image:Tensor, points:Tensor, pixel:Tensor, depth:Tensor, min_di
     return points
 
 
+# ----------------- class  for geojson -----------------
+
+class GeoJson():
+    def __init__(self)->None:
+        pass
+    
+
+class GeoFeature():
+    def __init__(self) -> None:
+        self.type = "Feature"
+
+
+# ------------------------------------------------------
+
+
 
 class EgoPose():
     def __init__(self, json_data) -> None:
@@ -296,6 +311,30 @@ class Scene():
             
         points = torch.concatenate(points_list, dim=0)
         return points
+    
+    def get_feature(self):
+        coordinates = []
+        for sample in self.sample_list:
+            for lidar in sample.lidars:
+                ego_pos = lidar.ego_translation
+                coordinates.append([ego_pos[0].item()/1000, ego_pos[1].item()/1000])
+        
+        feature = {
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": coordinates
+            },
+            "properties":{
+                "scene": self.name,
+                "token": self.token,
+                "description": self.description
+            }
+        }
+        
+        return feature
+    
+    
 
 class Nuscene():
     def __init__(self, root:str) -> None:
@@ -382,4 +421,16 @@ class Nuscene():
     
     def get_scenes(self)->dict[str,Scene]:
         return self.scene_map
+    
+    def get_feature_collection(self):
+        features = []
+        for token, scene in self.scene_map.items():
+            features.append(scene.get_feature())
+        
+        feature_collection = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+        
+        return feature_collection
     
